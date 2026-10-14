@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Drop this entry into your MCP client config and edit the paths/credentials.",
+    "Claude Desktop (macOS): ~/Library/Application Support/Claude/claude_desktop_config.json",
+    "Cursor: ~/.cursor/mcp.json",
+    "The connector is read-only unless FRESHDESK_ENABLE_WRITES is set to 'true'.",
+    "Do not commit real API keys - prefer your OS keychain or an env-var indirection."
+  ],
+  "mcpServers": {
+    "freshdesk": {
+      "command": "python",
+      "args": ["-m", "freshdesk_connector.cli", "serve"],
+      "cwd": "/absolute/path/to/freshdesk-mcp-connector",
+      "env": {
+        "FRESHDESK_DOMAIN": "yourcompany",
+        "FRESHDESK_API_KEY": "replace-me",
+        "FRESHDESK_PLAN": "auto",
+        "FRESHDESK_ENABLE_WRITES": "false",
+        "PYTHONPATH": "src"
+      }
+    },
+    "freshdesk-local-mock": {
+      "_comment": "Same server, pointed at the bundled mock. Useful for demos and for testing an agent's prompt without touching a real account. Start it with: python -m freshdesk_connector.cli mock --port 8099",
+      "command": "python",
+      "args": ["-m", "freshdesk_connector.cli", "serve"],
+      "cwd": "/absolute/path/to/freshdesk-mcp-connector",
+      "env": {
+        "FRESHDESK_DOMAIN": "acme",
+        "FRESHDESK_API_KEY": "mock-api-key",
+        "FRESHDESK_BASE_URL": "http://127.0.0.1:8099",
+        "PYTHONPATH": "src"
+      }
+    }
+  }
+}

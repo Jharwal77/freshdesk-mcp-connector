@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Unit and integration tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q
+
+      - name: Offline end-to-end self-test
+        run: python -m freshdesk_connector.cli self-test
+
+      - name: Demo workflows (mock)
+        run: python -m freshdesk_connector.cli demo --mock > /tmp/demo.json
+
+      - name: Tool specification is up to date
+        run: |
+          python -m freshdesk_connector.cli tools --writes --out /tmp/mcp-tools.json
+          python - <<'PY'
+          import json
+          spec = json.load(open("/tmp/mcp-tools.json"))
+          assert spec["tool_count"] == 14, spec["tool_count"]
+          names = {t["name"] for t in spec["tools"]}
+          assert "freshdesk_search_tickets" in names
+          assert "freshdesk_add_private_note" in names
+          print("tool spec OK:", spec["tool_count"], "tools")
+          PY
+
+      - name: No secrets committed
+        run: |
+          if git grep -nE '(api[_-]?key|secret|token)\s*[:=]\s*["'"'"'][A-Za-z0-9_-]{16,}' -- ':!*.example' ':!docs/*'; then
+            echo "::error::possible committed credential"
+            exit 1
+          fi
+          echo "no credential-looking strings found"

@@ -1,0 +1,758 @@
+{
+  "server": {
+    "name": "freshdesk-connector",
+    "version": "0.1.0",
+    "transport": [
+      "stdio"
+    ]
+  },
+  "writes_included": true,
+  "notes": [
+    "Freshdesk authenticates with an API key as the HTTP Basic username, so there is no OAuth flow to document; see CAPABILITIES.md for the credential model.",
+    "search_tickets is the workhorse: it accepts human labels (open/urgent) and the connector translates them into Freshdesk's numeric filter enums.",
+    "Tokens are never returned by any tool; errors carry actionable hints instead."
+  ],
+  "instructions": "This connector gives you read access to a merchant's Freshdesk helpdesk: tickets,\nconversations, contacts, companies, agents and groups. It is read-only unless the\noperator explicitly enabled a single guarded write tool.\n\nWork in this order:\n1. `freshdesk_connector_health` if you have any doubt the credentials work.\n2. `freshdesk_get_ticket_fields` + `freshdesk_list_groups` to learn this account's\n   real filter field names and routing teams. Field names are account-specific and\n   case-sensitive; guessing one produces an opaque HTTP 400.\n3. Then search or list.\n\nThree limits will silently corrupt an answer if you ignore them. Every tool result\nstates which one applies:\n* The ticket listing endpoint returns only tickets *created in the last 30 days*\n  unless you pass `updated_since` (hard ceiling: 300 pages / 30,000 tickets).\n* The search endpoint filters structured fields only - there is **no full-text\n  search** - returns a fixed 30 per page, and refuses to go past page 10, so a\n  single query can see at most 300 tickets.\n* Freshdesk rate limits are **per merchant account and shared with every other\n  integration**. Call `freshdesk_rate_limit_status` before a large scan, and prefer\n  narrow filters over wide scans.\n\nNever present a partial or truncated result as complete: check `pagination.truncated`\nand `warnings` and say so in your answer. Never quote an entry with\n`visibility=internal` to a customer; those are private agent notes.",
+  "tool_count": 14,
+  "tools": [
+    {
+      "name": "freshdesk_add_private_note",
+      "description": "Add an internal (private) note to a ticket. Human approval required.\n\nOnly registered when the operator sets FRESHDESK_ENABLE_WRITES=true, and\neven then it writes a note the customer cannot see - never a public reply.\nAsk the user to confirm the text before calling, and pass a stable\n`idempotency_key` so a retry cannot double-post (Freshdesk has no native\nidempotency support).",
+      "input_schema": {
+        "properties": {
+          "ticket_id": {
+            "title": "Ticket Id",
+            "type": "integer"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          }
+        },
+        "required": [
+          "ticket_id",
+          "body"
+        ],
+        "title": "add_private_noteArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_connector_health",
+      "description": "Check that the connector can authenticate and reach Freshdesk.\n\nUse when: a previous call failed oddly, or at the start of a session on a\nnew account. Returns authentication status, round-trip latency, whether\nwrites are enabled, and the domain in use. Costs one API call.",
+      "input_schema": {
+        "properties": {},
+        "title": "connector_healthArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_get_company",
+      "description": "Fetch one company (account) record, optionally with its contacts.\n\nUse when: you need account tier, health score or industry to judge\nseverity, or you are assembling a 360 view of a business customer.",
+      "input_schema": {
+        "properties": {
+          "company_id": {
+            "title": "Company Id",
+            "type": "integer"
+          },
+          "include_contacts": {
+            "default": false,
+            "title": "Include Contacts",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "company_id"
+        ],
+        "title": "get_companyArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_get_contact",
+      "description": "Look up one customer contact by id, email or phone.\n\nUse when: you have an identifier from a ticket, an email thread or a caller.\nProvide exactly one. Email is resolved server-side; phone falls back to a\nsearch because Freshdesk does not index phones on the list endpoint.",
+      "input_schema": {
+        "properties": {
+          "contact_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Contact Id"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Email"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Phone"
+          }
+        },
+        "title": "get_contactArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_get_ticket",
+      "description": "Fetch one ticket by id, optionally with its full conversation timeline.\n\nUse when: you have a ticket id and need the whole picture - description,\nSLA clock, timeline, and the replies and private notes.\nConversations are labelled `visibility: internal | public`; internal entries\nare private agent notes and must never be quoted to a customer.",
+      "input_schema": {
+        "properties": {
+          "ticket_id": {
+            "title": "Ticket Id",
+            "type": "integer"
+          },
+          "include_conversations": {
+            "default": true,
+            "title": "Include Conversations",
+            "type": "boolean"
+          },
+          "include_company": {
+            "default": false,
+            "title": "Include Company",
+            "type": "boolean"
+          },
+          "conversation_limit": {
+            "default": 10,
+            "title": "Conversation Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ticket_id"
+        ],
+        "title": "get_ticketArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_get_ticket_fields",
+      "description": "List this account's ticket fields, including custom fields.\n\nUse when: before any search that touches a custom field, or after an HTTP\n400 from `freshdesk_search_tickets`. Field names are account-specific and\ncase-sensitive; the returned `filter_field_names` are exactly what the\nsearch tool accepts in `custom_fields`.",
+      "input_schema": {
+        "properties": {},
+        "title": "get_ticket_fieldsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_list_agents",
+      "description": "List support agents, optionally filtered to one group.\n\nUse when: you need a human-readable name for an `agent_id` / `responder_id`,\nor you are deciding who owns a ticket. Combine with `freshdesk_list_groups`\nto map routing teams.",
+      "input_schema": {
+        "properties": {
+          "group_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Group Id"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "list_agentsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_list_groups",
+      "description": "List routing groups (Payments Support, Settlements, Escalations, ...).\n\nUse when: before filtering by group_id. Group ids are account-specific, and\nan agent that guesses one will silently return the wrong team's tickets.",
+      "input_schema": {
+        "properties": {},
+        "title": "list_groupsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_list_ticket_conversations",
+      "description": "List the reply/note timeline of one ticket, oldest first.\n\nUse when: you need the history - what the agent said, what the customer\nsaid, and what was noted internally. Entries carry\n`visibility: internal | public`; set `include_private=False` to see only\nwhat the customer can see, which is the right view for drafting a reply.",
+      "input_schema": {
+        "properties": {
+          "ticket_id": {
+            "title": "Ticket Id",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "include_private": {
+            "default": true,
+            "title": "Include Private",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ticket_id"
+        ],
+        "title": "list_ticket_conversationsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_list_tickets",
+      "description": "Browse tickets chronologically, newest first by default.\n\nUse when: you need an ordered sweep of recent tickets, a broad \"what came in\ntoday\" view, or when filters are unknown.\nAvoid when: you know what you are looking for - `freshdesk_search_tickets`\nis cheaper and can reach older tickets.\n\nCaveats returned in the result: without `updated_since` Freshdesk returns\nonly tickets *created in the last 30 days*; `include_description` costs 3x\nthe rate-limit budget because Freshdesk charges extra for `include=`.\n\nArgs:\n    updated_since: ISO date/timestamp. Widen beyond the 30-day default window.\n    predefined_filter: one of all_tickets, new_and_my_open, watching, spam, deleted.\n    limit: max records to return this call (1-100). Exactly one API call is\n        spent per call, so raise `limit` rather than paging for small walks.\n    cursor: pass `pagination.next_cursor` from a previous call to continue\n        exactly where it stopped.",
+      "input_schema": {
+        "properties": {
+          "updated_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Updated Since"
+          },
+          "predefined_filter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Predefined Filter"
+          },
+          "requester_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Requester Id"
+          },
+          "company_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Company Id"
+          },
+          "order_by": {
+            "default": "updated_at",
+            "title": "Order By",
+            "type": "string"
+          },
+          "order_type": {
+            "default": "desc",
+            "title": "Order Type",
+            "type": "string"
+          },
+          "include_description": {
+            "default": false,
+            "title": "Include Description",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 25,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cursor"
+          }
+        },
+        "title": "list_ticketsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_rate_limit_status",
+      "description": "Report this connector's live view of the shared Freshdesk rate budget.\n\nUse when: about to run a multi-page scan, or after a 429. Returns the\neffective per-minute ceiling, how much of the window is spent, per-endpoint\nsub-limits, and any recent throttling. Costs zero API calls.",
+      "input_schema": {
+        "properties": {},
+        "title": "rate_limit_statusArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_search_contacts",
+      "description": "Find contacts by email, phone, name or company.\n\nUse when: you need the customer behind a ticket, or every contact at an\naccount. Requires at least one filter - unfiltered contact listing is\nexpensive and is refused. Matching is exact-ish (Freshdesk's contact search\nis not fuzzy), so partial names may return nothing.",
+      "input_schema": {
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Email"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Phone"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Name"
+          },
+          "company_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Company Id"
+          },
+          "limit": {
+            "default": 25,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "search_contactsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_search_tickets",
+      "description": "Search tickets by structured fields. This is the workhorse.\n\nUse when: \"open urgent tickets\", \"tickets in the Settlements group\",\n\"everything tagged autopay created this month\", \"unassigned tickets\",\n\"tickets for this order id\".\n\nFriendly labels are translated to Freshdesk's numeric enums for you:\nstatus accepts open / pending / resolved / closed / waiting_on_customer /\nwaiting_on_third_party; priority accepts low / medium / high / urgent.\nPass lists to build an OR (status=[\"open\",\"pending\"]).\n\nCaveats (also returned in the result): no full-text search - structured\nfields only; 30 records per page; page 10 is the hard ceiling, so at most\n300 tickets are reachable per query. Split wide queries by date range.\n\nArgs:\n    priority_at_least: e.g. \"high\" means high or urgent.\n    due_before: ISO date - the standard way to find SLA-risk tickets.\n    custom_fields: {\"cf_order_id\": \"order_123\"} - call\n        `freshdesk_get_ticket_fields` first for this account's field names.\n    include_unassigned_agent: only tickets with no agent assigned.\n    cursor: continue a previous search; the cursor is bound to the filter set.",
+      "input_schema": {
+        "properties": {
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority"
+          },
+          "priority_at_least": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority At Least"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Type"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Id"
+          },
+          "group_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Group Id"
+          },
+          "requester_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Requester Id"
+          },
+          "company_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Company Id"
+          },
+          "tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tag"
+          },
+          "created_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created After"
+          },
+          "created_before": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created Before"
+          },
+          "updated_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Updated After"
+          },
+          "updated_before": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Updated Before"
+          },
+          "due_before": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Due Before"
+          },
+          "custom_fields": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Custom Fields"
+          },
+          "include_unassigned_agent": {
+            "default": false,
+            "title": "Include Unassigned Agent",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 25,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "max_pages": {
+            "default": 1,
+            "title": "Max Pages",
+            "type": "integer"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cursor"
+          }
+        },
+        "title": "search_ticketsArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "freshdesk_search_tickets_by_text",
+      "description": "Find tickets containing a keyword, using a bounded client-side scan.\n\nUse when: you only have free text - a customer's name, an order id inside\nthe body, a phrase from a complaint - and need candidate tickets.\nAvoid when: structured filters would do; a scan costs one API call per page\nfrom the shared account budget.\n\nThis exists because Freshdesk has no full-text search. The result always\nstates how many tickets were examined and whether the scan was complete. If\n`pagination.scan_complete` is false, matches may exist that were not seen -\nsay so rather than answering as if you searched everything.\n\nArgs:\n    text: at least 3 characters, matched case-insensitively.\n    updated_since: narrow the scan window (strongly recommended).\n    include_descriptions: also scan description bodies; costs 3x budget per page.\n    max_pages: scan depth ceiling (1-10).",
+      "input_schema": {
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "updated_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Updated Since"
+          },
+          "include_descriptions": {
+            "default": false,
+            "title": "Include Descriptions",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "max_pages": {
+            "default": 3,
+            "title": "Max Pages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "search_tickets_by_textArguments",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    }
+  ]
+}
